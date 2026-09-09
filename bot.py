@@ -26,7 +26,7 @@ import telebot
 from telebot import types
 
 # --- Configurable Conversion Rate ---
-USDT_BDT_RATE = 120.0  # 1 USDT = 120 BDT
+USDT_BDT_RATE = 120.0
 
 # --- Flask Keep Alive ---
 app = Flask("")
@@ -82,6 +82,7 @@ active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_selected_plan = {}
+blocked_users = set()  # 🆕 Blocked users set
 
 # --- Required Channels System (Supabase PostgreSQL) ---
 import psycopg2
@@ -180,6 +181,106 @@ def is_user_verified(user_id):
     if user_id == OWNER_ID or user_id in admin_ids:
         return True, []
     return check_user_channels(user_id)
+
+# --- 🆕 Blocked Users Functions ---
+def load_blocked_users():
+    """Load blocked users from database"""
+    global blocked_users
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM blocked_users")
+        for row in c.fetchall():
+            blocked_users.add(row[0])
+        conn.close()
+        logger.info(f"✅ Loaded {len(blocked_users)} blocked users.")
+    except Exception as e:
+        logger.error(f"Error loading blocked users: {e}")
+
+def is_user_blocked(user_id):
+    """Check if a user is blocked"""
+    return user_id in blocked_users
+
+def block_user(user_id, blocked_by):
+    """Block a user"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO blocked_users (user_id, blocked_by) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id, blocked_by)
+        )
+        conn.commit()
+        conn.close()
+        blocked_users.add(user_id)
+        return True
+    except Exception as e:
+        logger.error(f"Error blocking user: {e}")
+        return False
+
+def unblock_user(user_id):
+    """Unblock a user"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        c = conn.cursor()
+        c.execute("DELETE FROM blocked_users WHERE user_id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        blocked_users.discard(user_id)
+        return True
+    except Exception as e:
+        logger.error(f"Error unblocking user: {e}")
+        return False
+
+# --- 🆕 User Management Functions ---
+def get_all_users():
+    """Get all users from active_users"""
+    return list(active_users)
+
+def get_user_details(user_id):
+    """Get detailed info about a user"""
+    details = {
+        "user_id": user_id,
+        "is_owner": user_id == OWNER_ID,
+        "is_admin": user_id in admin_ids,
+        "is_blocked": is_user_blocked(user_id),
+        "is_active": user_id in active_users,
+        "file_count": get_user_file_count(user_id),
+        "file_limit": get_user_file_limit(user_id),
+        "subscription": None
+    }
+    
+    if user_id in user_subscriptions:
+        sub = user_subscriptions[user_id]
+        if sub["expiry"] > datetime.now():
+            details["subscription"] = {
+                "plan": sub.get("plan_name", "Premium"),
+                "expiry": sub["expiry"]
+            }
+    
+    return details
+
+def get_bot_stats():
+    """Get bot statistics"""
+    total_users = len(active_users)
+    total_files = sum(len(files) for files in user_files.values())
+    total_subscribed = sum(1 for uid, sub in user_subscriptions.items() if sub["expiry"] > datetime.now())
+    total_blocked = len(blocked_users)
+    total_admins = len(admin_ids)
+    
+    return {
+        "total_users": total_users,
+        "total_files": total_files,
+        "total_subscribed": total_subscribed,
+        "total_blocked": total_blocked,
+        "total_admins": total_admins
+    }
 
 # --- Malware Detection Configuration ---
 MALWARE_SIGNATURES = [
@@ -302,6 +403,9 @@ def load_data():
         logger.info(f"Data loaded successfully.")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
+
+# Load blocked users from Supabase
+load_blocked_users()
 
 init_db()
 load_data()
@@ -681,13 +785,22 @@ def create_admin_panel_inline():
         types.InlineKeyboardButton("📢 𝗔𝗱𝗱 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="add_channel"),
         types.InlineKeyboardButton("❌ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="remove_channel"),
     )
+    # 🆕 User Management Buttons
     markup.add(
-        types.InlineKeyboardButton("📣 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁", callback_data="broadcast"),
-        types.InlineKeyboardButton("🔐 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock"),
+        types.InlineKeyboardButton("📋 𝗔𝗹𝗹 𝗨𝘀𝗲𝗿𝘀", callback_data="all_users"),
+        types.InlineKeyboardButton("🔍 𝗙𝗶𝗻𝗱 𝗨𝘀𝗲𝗿", callback_data="find_user"),
     )
     markup.add(
-        types.InlineKeyboardButton("⚙️ 𝗥𝘂𝗻 𝗔𝗹𝗹 𝗦𝗰𝗿𝗶𝗽𝘁𝘀", callback_data="run_all_scripts"),
         types.InlineKeyboardButton("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats"),
+        types.InlineKeyboardButton("📣 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁", callback_data="broadcast"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("🚫 𝗕𝗹𝗼𝗰𝗸 𝗨𝘀𝗲𝗿", callback_data="block_user"),
+        types.InlineKeyboardButton("🔓 𝗨𝗻𝗯𝗹𝗼𝗰𝗸 𝗨𝘀𝗲𝗿", callback_data="unblock_user"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔐 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock"),
+        types.InlineKeyboardButton("⚙️ 𝗥𝘂𝗻 𝗔𝗹𝗹 𝗦𝗰𝗿𝗶𝗽𝘁𝘀", callback_data="run_all_scripts"),
     )
     return markup
 
@@ -696,6 +809,12 @@ def _logic_send_welcome(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     user_name = message.from_user.first_name
+    
+    # Check if user is blocked
+    if is_user_blocked(user_id) and user_id not in admin_ids:
+        bot.send_message(chat_id, "🚫 **আপনি বট ব্যবহার করতে পারবেন না। আপনি ব্লক করা হয়েছেন।**")
+        return
+    
     if bot_locked and user_id not in admin_ids:
         bot.send_message(chat_id, "⚠️ **Bot is temporarily locked by Admin.**")
         return
@@ -743,7 +862,12 @@ def _logic_view_plans(message_or_call):
 def _logic_upload_file(message):
     user_id = message.from_user.id
     
-    # --- Channel Check (Owner/Admin skip) ---
+    # Check if user is blocked
+    if is_user_blocked(user_id) and user_id not in admin_ids:
+        bot.reply_to(message, "🚫 **আপনি ব্লক করা হয়েছেন। আপনি ফাইল আপলোড করতে পারবেন না।**")
+        return
+    
+    # Channel Check (Owner/Admin skip)
     if user_id not in admin_ids and user_id != OWNER_ID:
         is_verified, not_joined = is_user_verified(user_id)
         if not is_verified:
@@ -757,7 +881,6 @@ def _logic_upload_file(message):
             markup.add(types.InlineKeyboardButton("🔄 Check Again", callback_data="check_verify"))
             bot.reply_to(message, msg, reply_markup=markup, parse_mode="Markdown")
             return
-    # --- End Channel Check ---
     
     if bot_locked and user_id not in admin_ids:
         bot.reply_to(message, "⚠️ **Bot is locked by Admin.**")
@@ -801,6 +924,11 @@ def handle_file_upload_doc(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     doc = message.document
+    
+    # Check if user is blocked
+    if is_user_blocked(user_id) and user_id not in admin_ids:
+        bot.reply_to(message, "🚫 **আপনি ব্লক করা হয়েছেন। আপনি ফাইল আপলোড করতে পারবেন না।**")
+        return
     
     if user_id not in admin_ids and user_id != OWNER_ID:
         if user_id not in user_subscriptions or user_subscriptions[user_id]["expiry"] <= datetime.now():
@@ -903,6 +1031,101 @@ def handle_callbacks(call):
                 markup.add(types.InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.replace('@', '')}"))
             markup.add(types.InlineKeyboardButton("🔄 Check Again", callback_data="check_verify"))
             bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+    # --- 🆕 All Users Callback ---
+    elif data == "all_users" and user_id in admin_ids:
+        bot.answer_callback_query(call.id)
+        users = get_all_users()
+        if not users:
+            bot.send_message(call.message.chat.id, "ℹ️ কোনো ইউজার পাওয়া যায়নি।")
+            return
+        
+        total = len(users)
+        msg = f"📋 **ইউজার লিস্ট** (মোট: {total})\n\n"
+        
+        # Show first 10 users with pagination
+        page = 0
+        per_page = 10
+        start = page * per_page
+        end = min(start + per_page, total)
+        
+        for uid in users[start:end]:
+            details = get_user_details(uid)
+            status = "👑 Owner" if details["is_owner"] else "🛡️ Admin" if details["is_admin"] else "🚫 Blocked" if details["is_blocked"] else "📦 Subscribed" if details["subscription"] else "🆓 Free"
+            msg += f"• `{uid}` → {status} | Files: {details['file_count']}\n"
+        
+        if total > per_page:
+            msg += f"\n📌 *পৃষ্ঠা {page+1}/{((total-1)//per_page)+1}*"
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("⏪ Prev", callback_data=f"users_page_{page-1}"),
+                types.InlineKeyboardButton(f"{page+1}/{(total-1)//per_page+1}", callback_data="ignore"),
+                types.InlineKeyboardButton("Next ⏩", callback_data=f"users_page_{page+1}")
+            )
+            bot.send_message(call.message.chat.id, msg, reply_markup=markup, parse_mode="Markdown")
+        else:
+            bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
+
+    # --- Users Pagination ---
+    elif data.startswith("users_page_") and user_id in admin_ids:
+        page = int(data.split("_")[2])
+        users = get_all_users()
+        total = len(users)
+        per_page = 10
+        start = page * per_page
+        
+        if start >= total or page < 0:
+            bot.answer_callback_query(call.id, "এই পৃষ্ঠায় কোনো ডেটা নেই।")
+            return
+        
+        end = min(start + per_page, total)
+        msg = f"📋 **ইউজার লিস্ট** (মোট: {total})\n\n"
+        
+        for uid in users[start:end]:
+            details = get_user_details(uid)
+            status = "👑 Owner" if details["is_owner"] else "🛡️ Admin" if details["is_admin"] else "🚫 Blocked" if details["is_blocked"] else "📦 Subscribed" if details["subscription"] else "🆓 Free"
+            msg += f"• `{uid}` → {status} | Files: {details['file_count']}\n"
+        
+        total_pages = (total - 1) // per_page + 1
+        msg += f"\n📌 *পৃষ্ঠা {page+1}/{total_pages}*"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("⏪ Prev", callback_data=f"users_page_{page-1}") if page > 0 else types.InlineKeyboardButton("⏪ Prev", callback_data="ignore"),
+            types.InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="ignore"),
+            types.InlineKeyboardButton("Next ⏩", callback_data=f"users_page_{page+1}") if page < total_pages - 1 else types.InlineKeyboardButton("Next ⏩", callback_data="ignore")
+        )
+        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    # --- 🆕 Find User Callback ---
+    elif data == "find_user" and user_id in admin_ids:
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🔍 **ইউজার আইডি লিখুন:**\n\nযেমন: `123456789`",
+            parse_mode="Markdown"
+        )
+        bot.register_next_step_handler(msg, process_find_user)
+
+    # --- 🆕 Block User Callback ---
+    elif data == "block_user" and user_id in admin_ids:
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🚫 **ব্লক করতে ইউজার আইডি লিখুন:**\n\nযেমন: `123456789`",
+            parse_mode="Markdown"
+        )
+        bot.register_next_step_handler(msg, process_block_user)
+
+    # --- 🆕 Unblock User Callback ---
+    elif data == "unblock_user" and user_id in admin_ids:
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🔓 **আনব্লক করতে ইউজার আইডি লিখুন:**\n\nযেমন: `123456789`",
+            parse_mode="Markdown"
+        )
+        bot.register_next_step_handler(msg, process_unblock_user)
 
     # --- Interactive Module Installer ---
     elif data.startswith("instmod_"):
@@ -1049,6 +1272,19 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "Deleted!")
         bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` deleted.", parse_mode="Markdown")
 
+    # --- 🆕 Stats Callback (Enhanced) ---
+    elif data == "stats" and user_id in admin_ids:
+        bot.answer_callback_query(call.id)
+        stats = get_bot_stats()
+        msg = (f"📊 **𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝗶𝘀𝘁𝗶𝗰𝘀**\n\n"
+               f"👥 **মোট ইউজার:** `{stats['total_users']}`\n"
+               f"📁 **মোট ফাইল:** `{stats['total_files']}`\n"
+               f"💎 **সাবস্ক্রাইবড:** `{stats['total_subscribed']}`\n"
+               f"🚫 **ব্লক করা:** `{stats['total_blocked']}`\n"
+               f"🛡️ **অ্যাডমিন:** `{stats['total_admins']}`\n"
+               f"🔐 **বট লক:** `{'✅ লকড' if bot_locked else '❌ আনলকড'}`")
+        bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
+
 # --- Step Handlers ---
 def process_add_channel(message):
     user_id = message.from_user.id
@@ -1070,6 +1306,109 @@ def process_add_channel(message):
             bot.reply_to(message, "❌ চ্যানেল যোগ করতে সমস্যা হয়েছে।")
     except Exception as e:
         bot.reply_to(message, f"❌ **চ্যানেল খুঁজে পাওয়া যায়নি বা এরর হয়েছে!**\n\nError: `{str(e)}`", parse_mode="Markdown")
+
+# --- 🆕 Find User Handler ---
+def process_find_user(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        return
+    
+    try:
+        target_id = int(message.text.strip())
+        details = get_user_details(target_id)
+        
+        # Try to get username
+        username = "N/A"
+        try:
+            chat = bot.get_chat(target_id)
+            if chat.username:
+                username = f"@{chat.username}"
+            else:
+                username = chat.first_name or "N/A"
+        except:
+            pass
+        
+        status = "👑 Owner" if details["is_owner"] else "🛡️ Admin" if details["is_admin"] else "🚫 Blocked" if details["is_blocked"] else "📦 Subscribed" if details["subscription"] else "🆓 Free"
+        
+        msg = (f"🔍 **ইউজার ডিটেইলস**\n\n"
+               f"🆔 **আইডি:** `{target_id}`\n"
+               f"👤 **নাম/ইউজারনেম:** {username}\n"
+               f"📊 **স্ট্যাটাস:** {status}\n"
+               f"📁 **ফাইল কাউন্ট:** `{details['file_count']}` / `{details['file_limit']}`\n"
+               f"📌 **এক্টিভ:** `{'হ্যাঁ' if details['is_active'] else 'না'}`")
+        
+        if details["subscription"]:
+            sub = details["subscription"]
+            expiry_str = sub["expiry"].strftime("%Y-%m-%d %H:%M")
+            days_left = (sub["expiry"] - datetime.now()).days
+            msg += f"\n💎 **প্ল্যান:** `{sub['plan']}`\n📅 **শেষ হবে:** `{expiry_str}` ({days_left} দিন বাকি)"
+        else:
+            msg += f"\n💎 **প্ল্যান:** `নেই`"
+        
+        bot.reply_to(message, msg, parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "❌ **সঠিক ইউজার আইডি দিন!** (শুধু সংখ্যা)")
+    except Exception as e:
+        bot.reply_to(message, f"❌ **ইউজার খুঁজে পাওয়া যায়নি!**\nError: {str(e)}")
+
+# --- 🆕 Block User Handler ---
+def process_block_user(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        return
+    
+    try:
+        target_id = int(message.text.strip())
+        
+        if target_id == OWNER_ID:
+            bot.reply_to(message, "❌ **ওনারকে ব্লক করা যাবে না!**")
+            return
+        if target_id in admin_ids:
+            bot.reply_to(message, "❌ **অ্যাডমিনকে ব্লক করা যাবে না!**")
+            return
+        if is_user_blocked(target_id):
+            bot.reply_to(message, f"ℹ️ **ইউজার `{target_id}` ইতিমধ্যেই ব্লক করা আছে।**")
+            return
+        
+        if block_user(target_id, user_id):
+            bot.reply_to(message, f"✅ **ইউজার `{target_id}` ব্লক করা হয়েছে!**\n\nএই ইউজার এখন বট ব্যবহার করতে পারবেনা।")
+            # Try to notify the user
+            try:
+                bot.send_message(target_id, "🚫 **আপনি বট ব্যবহার থেকে ব্লক করা হয়েছেন।**")
+            except:
+                pass
+        else:
+            bot.reply_to(message, "❌ **ব্লক করতে সমস্যা হয়েছে!**")
+    except ValueError:
+        bot.reply_to(message, "❌ **সঠিক ইউজার আইডি দিন!** (শুধু সংখ্যা)")
+    except Exception as e:
+        bot.reply_to(message, f"❌ **Error:** {str(e)}")
+
+# --- 🆕 Unblock User Handler ---
+def process_unblock_user(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        return
+    
+    try:
+        target_id = int(message.text.strip())
+        
+        if not is_user_blocked(target_id):
+            bot.reply_to(message, f"ℹ️ **ইউজার `{target_id}` ব্লক করা নেই।**")
+            return
+        
+        if unblock_user(target_id):
+            bot.reply_to(message, f"✅ **ইউজার `{target_id}` আনব্লক করা হয়েছে!**\n\nএই ইউজার এখন বট ব্যবহার করতে পারবে।")
+            try:
+                bot.send_message(target_id, "✅ **আপনি আনব্লক করা হয়েছে। এখন বট ব্যবহার করতে পারবেন।**")
+            except:
+                pass
+        else:
+            bot.reply_to(message, "❌ **আনব্লক করতে সমস্যা হয়েছে!**")
+    except ValueError:
+        bot.reply_to(message, "❌ **সঠিক ইউজার আইডি দিন!** (শুধু সংখ্যা)")
+    except Exception as e:
+        bot.reply_to(message, f"❌ **Error:** {str(e)}")
 
 def process_binance_txid(message, plan_id):
     pay_order_id = message.text.strip()
