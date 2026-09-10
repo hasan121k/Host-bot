@@ -82,7 +82,7 @@ active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_selected_plan = {}
-blocked_users = set()  # 🆕 Blocked users set
+blocked_users = set()
 
 # --- Required Channels System (Supabase PostgreSQL) ---
 import psycopg2
@@ -190,7 +190,7 @@ def send_force_sub_message(chat_id, not_joined):
     
     bot.send_message(chat_id, msg, reply_markup=markup, parse_mode="Markdown")
 
-# --- 🆕 Blocked Users Functions ---
+# --- Blocked Users Functions ---
 def load_blocked_users():
     """Load blocked users from database"""
     global blocked_users
@@ -246,7 +246,7 @@ def unblock_user(user_id):
         logger.error(f"Error unblocking user: {e}")
         return False
 
-# --- 🆕 User Management Functions ---
+# --- User Management Functions ---
 def get_all_users():
     """Get all users from active_users"""
     return list(active_users)
@@ -779,7 +779,7 @@ def create_admin_panel_inline():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("➕ 𝗔𝗱𝗱 𝗣𝗹𝗮𝗻", callback_data="add_plan_init"),
-        types.InlineKeyboardButton("🗑️ 𝗠𝗮𝗻𝗮𝗴𝗲 𝗣𝗹𝗮𝗻𝘀", callback_data="manage_plans"),
+        types.InlineKeyboardButton("🗑️ 𝗠𝗮𝗻𝗮𝗴𝗲 𝗣𝗹𝗮ns", callback_data="manage_plans"),
     )
     markup.add(
         types.InlineKeyboardButton("💎 𝗔𝗱𝗱 𝗦𝘂𝗯𝘀𝗰𝗿𝗶𝗽𝘁𝗶𝗼𝗻", callback_data="add_subscription"),
@@ -793,7 +793,6 @@ def create_admin_panel_inline():
         types.InlineKeyboardButton("📢 𝗔𝗱𝗱 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="add_channel"),
         types.InlineKeyboardButton("❌ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="remove_channel"),
     )
-    # 🆕 User Management Buttons
     markup.add(
         types.InlineKeyboardButton("📋 𝗔𝗹𝗹 𝗨𝘀𝗲𝗿𝘀", callback_data="all_users"),
         types.InlineKeyboardButton("🔍 𝗙𝗶𝗻𝗱 𝗨𝘀𝗲𝗿", callback_data="find_user"),
@@ -818,12 +817,10 @@ def _logic_send_welcome(message):
     chat_id = message.chat.id
     user_name = message.from_user.first_name
     
-    # Check if user is blocked
     if is_user_blocked(user_id) and user_id not in admin_ids:
         bot.send_message(chat_id, "🚫 **আপনি বট ব্যবহার করতে পারবেন না। আপনি ব্লক করা হয়েছেন।**")
         return
     
-    # 🔒 Force Subscription Check
     is_verified, not_joined = is_user_verified(user_id)
     if not is_verified:
         send_force_sub_message(chat_id, not_joined)
@@ -877,12 +874,10 @@ def _logic_upload_file(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # Check if user is blocked
     if is_user_blocked(user_id) and user_id not in admin_ids:
         bot.reply_to(message, "🚫 **আপনি ব্লক করা হয়েছেন। আপনি ফাইল আপলোড করতে পারবেন না।**")
         return
     
-    # 🔒 Force Subscription Check
     is_verified, not_joined = is_user_verified(user_id)
     if not is_verified:
         send_force_sub_message(chat_id, not_joined)
@@ -914,7 +909,6 @@ def _logic_check_files(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # 🔒 Force Subscription Check
     is_verified, not_joined = is_user_verified(user_id)
     if not is_verified:
         send_force_sub_message(chat_id, not_joined)
@@ -939,12 +933,10 @@ def handle_file_upload_doc(message):
     chat_id = message.chat.id
     doc = message.document
     
-    # Check if user is blocked
     if is_user_blocked(user_id) and user_id not in admin_ids:
         bot.reply_to(message, "🚫 **আপনি ব্লক করা হয়েছেন। আপনি ফাইল আপলোড করতে পারবেন না।**")
         return
 
-    # 🔒 Force Subscription Check
     is_verified, not_joined = is_user_verified(user_id)
     if not is_verified:
         send_force_sub_message(chat_id, not_joined)
@@ -1034,14 +1026,38 @@ def handle_callbacks(call):
     # --- Check Verify Callback ---
     elif data == "check_verify":
         user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        user_name = call.from_user.first_name
         is_verified, not_joined = is_user_verified(user_id)
+        
         if is_verified:
-            bot.answer_callback_query(call.id, "✅ ধন্যবাদ! আপনি সফলভাবে সব চ্যানেলে জয়েন করেছেন।")
+            bot.answer_callback_query(call.id, "✅ ধন্যবাদ! আপনি জয়েন করেছেন।")
             try:
-                bot.delete_message(call.message.chat.id, call.message.message_id)
+                bot.delete_message(chat_id, call.message.message_id)
             except:
                 pass
-            _logic_send_welcome(call)
+            
+            # Send welcome message with bottom keyboard
+            if user_id not in active_users:
+                add_active_user(user_id)
+            if user_id == OWNER_ID:
+                user_status = "👑 **Owner**"
+            elif user_id in admin_ids:
+                user_status = "🛡️ **Admin**"
+            elif user_id in user_subscriptions and user_subscriptions[user_id]["expiry"] > datetime.now():
+                sub = user_subscriptions[user_id]
+                days_left = (sub["expiry"] - datetime.now()).days
+                user_status = f"💎 **{sub.get('plan_name', 'Premium')} Active** ({days_left} Days left)"
+            else:
+                user_status = "🆓 **No Active Plan**"
+                
+            welcome_msg = (f"✨ **𝗪𝗲𝗹𝗰𝗼𝗺𝗲, {user_name}!** ✨\n\n"
+                           f"🆔 **𝗬𝗼𝘂𝗿 𝗜𝗗:** `{user_id}`\n"
+                           f"🔰 **𝗦𝘁𝗮𝘁𝘂𝘀:** {user_status}\n"
+                           f"📁 **𝗨𝗽𝗹𝗼𝗮𝗱𝗲𝗱 𝗙𝗶𝗹𝗲𝘀:** `{get_user_file_count(user_id)}` / `{get_user_file_limit(user_id)}`\n\n"
+                           f"💡 **𝗛𝗼𝘀𝘁 & 𝗥𝘂𝗻 𝘆𝗼𝘂𝗿 𝗣𝘆𝘁𝗵𝗼𝗻 (.𝗽𝘆) & 𝗝𝗦 (.𝗷𝘀) 𝗯𝗼𝘁𝘀 𝟮𝟰/𝟳.**\n"
+                           f"👇 *Select an option from the menu below:* ")
+            bot.send_message(chat_id, welcome_msg, reply_markup=create_reply_keyboard_main_menu(user_id), parse_mode="Markdown")
         else:
             bot.answer_callback_query(call.id, "❌ আপনি এখনো সবগুলো চ্যানেলে জয়েন করেননি!", show_alert=True)
             msg = "⚠️ **আপনি এখনো নিচের চ্যানেলগুলো জয়েন করেননি:**\n\n"
@@ -1054,11 +1070,11 @@ def handle_callbacks(call):
                 markup.add(types.InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{clean_user}"))
             markup.add(types.InlineKeyboardButton("🔄 চেক করুন", callback_data="check_verify"))
             try:
-                bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                bot.edit_message_text(msg, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             except:
                 pass
 
-    # --- 🆕 All Users Callback ---
+    # --- All Users Callback ---
     elif data == "all_users" and user_id in admin_ids:
         bot.answer_callback_query(call.id)
         users = get_all_users()
@@ -1122,7 +1138,7 @@ def handle_callbacks(call):
         )
         bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-    # --- 🆕 Find User Callback ---
+    # --- Find User Callback ---
     elif data == "find_user" and user_id in admin_ids:
         bot.answer_callback_query(call.id)
         msg = bot.send_message(
@@ -1132,7 +1148,7 @@ def handle_callbacks(call):
         )
         bot.register_next_step_handler(msg, process_find_user)
 
-    # --- 🆕 Block User Callback ---
+    # --- Block User Callback ---
     elif data == "block_user" and user_id in admin_ids:
         bot.answer_callback_query(call.id)
         msg = bot.send_message(
@@ -1142,7 +1158,7 @@ def handle_callbacks(call):
         )
         bot.register_next_step_handler(msg, process_block_user)
 
-    # --- 🆕 Unblock User Callback ---
+    # --- Unblock User Callback ---
     elif data == "unblock_user" and user_id in admin_ids:
         bot.answer_callback_query(call.id)
         msg = bot.send_message(
@@ -1297,7 +1313,7 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "Deleted!")
         bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` deleted.", parse_mode="Markdown")
 
-    # --- 🆕 Stats Callback (Enhanced) ---
+    # --- Stats Callback (Enhanced) ---
     elif data == "stats" and user_id in admin_ids:
         bot.answer_callback_query(call.id)
         stats = get_bot_stats()
@@ -1332,7 +1348,7 @@ def process_add_channel(message):
     except Exception as e:
         bot.reply_to(message, f"❌ **চ্যানেল খুঁজে পাওয়া যায়নি বা এরর হয়েছে!**\n\nError: `{str(e)}`", parse_mode="Markdown")
 
-# --- 🆕 Find User Handler ---
+# --- Find User Handler ---
 def process_find_user(message):
     user_id = message.from_user.id
     if user_id not in admin_ids:
@@ -1342,7 +1358,6 @@ def process_find_user(message):
         target_id = int(message.text.strip())
         details = get_user_details(target_id)
         
-        # Try to get username
         username = "N/A"
         try:
             chat = bot.get_chat(target_id)
@@ -1376,7 +1391,7 @@ def process_find_user(message):
     except Exception as e:
         bot.reply_to(message, f"❌ **ইউজার খুঁজে পাওয়া যায়নি!**\nError: {str(e)}")
 
-# --- 🆕 Block User Handler ---
+# --- Block User Handler ---
 def process_block_user(message):
     user_id = message.from_user.id
     if user_id not in admin_ids:
@@ -1408,7 +1423,7 @@ def process_block_user(message):
     except Exception as e:
         bot.reply_to(message, f"❌ **Error:** {str(e)}")
 
-# --- 🆕 Unblock User Handler ---
+# --- Unblock User Handler ---
 def process_unblock_user(message):
     user_id = message.from_user.id
     if user_id not in admin_ids:
@@ -1515,7 +1530,6 @@ def handle_main_buttons(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # 🔒 Force Subscription Check for any button click (excluding admin buttons for admins)
     if message.text != "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹" or user_id not in admin_ids:
         is_verified, not_joined = is_user_verified(user_id)
         if not is_verified:
