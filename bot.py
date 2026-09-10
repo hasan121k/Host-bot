@@ -300,16 +300,7 @@ MALWARE_SIGNATURES = [
     b"Rar!",
 ]
 
-ENCRYPTED_FILE_INDICATORS = [
-    b"openssl",
-    b"encrypted",
-    b"cipher",
-    b"AES",
-    b"DES",
-    b"RSA",
-    b"GPG",
-    b"PGP",
-]
+ENCRYPTED_FILE_INDICATORS = []
 
 SUSPICIOUS_KEYWORDS = [
     b"ransomware",
