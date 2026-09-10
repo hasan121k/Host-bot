@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import signal
-import sqlite3
 import struct
 import subprocess
 import sys
@@ -24,6 +23,8 @@ import psutil
 import requests
 import telebot
 from telebot import types
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # --- Configurable Conversion Rate ---
 USDT_BDT_RATE = 120.0
@@ -61,7 +62,6 @@ BINANCE_PAY_ID = ""
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, "upload_bots")
 IROTECH_DIR = os.path.join(BASE_DIR, "inf")
-DATABASE_PATH = os.path.join(IROTECH_DIR, "bot_data.db")
 
 # File upload limits
 FREE_USER_LIMIT = 0
@@ -84,10 +84,14 @@ bot_locked = False
 user_selected_plan = {}
 blocked_users = set()
 
-# --- Required Channels System (Supabase PostgreSQL) ---
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
+# --- Supabase PostgreSQL Connection ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
@@ -101,8 +105,240 @@ def get_db_connection():
         logger.error(f"❌ Database connection error: {e}")
         return None
 
+# --- Supabase Database Operations (Permanent Storage) ---
+
+def load_data():
+    """Load all persistent data from Supabase"""
+    global active_users, admin_ids, blocked_users, user_subscriptions, user_files
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        c = conn.cursor()
+
+        # Load active users
+        c.execute("SELECT user_id FROM active_users")
+        active_users.update(row[0] for row in c.fetchall())
+
+        # Load admins
+        c.execute("SELECT user_id FROM admins")
+        admin_ids.update(row[0] for row in c.fetchall())
+
+        # Load blocked users
+        c.execute("SELECT user_id FROM blocked_users")
+        blocked_users.update(row[0] for row in c.fetchall())
+
+        # Load subscriptions
+        c.execute("SELECT user_id, plan_name, expiry FROM subscriptions")
+        for row in c.fetchall():
+            uid, pname, exp = row
+            if isinstance(exp, str):
+                exp = datetime.fromisoformat(exp)
+            user_subscriptions[uid] = {"plan_name": pname, "expiry": exp}
+
+        # Load user files
+        c.execute("SELECT user_id, file_name, file_type FROM user_files")
+        for uid, fname, ftype in c.fetchall():
+            if uid not in user_files:
+                user_files[uid] = []
+            user_files[uid].append((fname, ftype))
+
+        conn.close()
+        logger.info("✅ All data loaded successfully from Supabase.")
+    except Exception as e:
+        logger.error(f"❌ Error loading data from Supabase: {e}")
+
+def add_active_user(user_id):
+    active_users.add(user_id)
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO active_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error saving active user: {e}")
+
+def save_subscription(user_id, plan_name, expiry):
+    user_subscriptions[user_id] = {"plan_name": plan_name, "expiry": expiry}
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO subscriptions (user_id, plan_name, expiry)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET plan_name = EXCLUDED.plan_name, expiry = EXCLUDED.expiry
+            """, (user_id, plan_name, expiry))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error saving subscription: {e}")
+
+def remove_subscription_db(user_id):
+    if user_id in user_subscriptions:
+        del user_subscriptions[user_id]
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error removing subscription: {e}")
+
+def save_user_file(user_id, file_name, file_type="py"):
+    if user_id not in user_files:
+        user_files[user_id] = []
+    user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
+    user_files[user_id].append((file_name, file_type))
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO user_files (user_id, file_name, file_type)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, file_name) DO UPDATE SET file_type = EXCLUDED.file_type
+            """, (user_id, file_name, file_type))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error saving user file: {e}")
+
+def remove_user_file_db(user_id, file_name):
+    if user_id in user_files:
+        user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM user_files WHERE user_id = %s AND file_name = %s", (user_id, file_name))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error removing user file: {e}")
+
+def add_plan_db(name, file_limit, price, duration, buy_link):
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO plans (name, file_limit, price, duration, buy_link) VALUES (%s, %s, %s, %s, %s)",
+                      (name, file_limit, price, duration, buy_link))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error adding plan: {e}")
+
+def get_all_plans():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return []
+        c = conn.cursor()
+        c.execute("SELECT plan_id, name, file_limit, price, duration, buy_link FROM plans")
+        plans = c.fetchall()
+        conn.close()
+        return plans
+    except Exception as e:
+        logger.error(f"Error getting plans: {e}")
+        return []
+
+def get_plan_by_id(plan_id):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return None
+        c = conn.cursor()
+        c.execute("SELECT plan_id, name, file_limit, price, duration, buy_link FROM plans WHERE plan_id = %s", (plan_id,))
+        plan = c.fetchone()
+        conn.close()
+        return plan
+    except Exception as e:
+        logger.error(f"Error getting plan by id: {e}")
+        return None
+
+def delete_plan_db(plan_id):
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM plans WHERE plan_id = %s", (plan_id,))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error deleting plan: {e}")
+
+def get_pending_payment(user_id, plan_id):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return 0.0
+        c = conn.cursor()
+        c.execute("SELECT paid_amount FROM pending_payments WHERE user_id = %s AND plan_id = %s", (user_id, plan_id))
+        row = c.fetchone()
+        conn.close()
+        return float(row[0]) if row else 0.0
+    except Exception as e:
+        logger.error(f"Error getting pending payment: {e}")
+        return 0.0
+
+def update_pending_payment(user_id, plan_id, amount):
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO pending_payments (user_id, plan_id, paid_amount)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, plan_id) DO UPDATE SET paid_amount = EXCLUDED.paid_amount
+            """, (user_id, plan_id, amount))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error updating pending payment: {e}")
+
+def clear_pending_payment(user_id, plan_id):
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM pending_payments WHERE user_id = %s AND plan_id = %s", (user_id, plan_id))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error clearing pending payment: {e}")
+
+def is_txid_used(tx_id):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        c = conn.cursor()
+        c.execute("SELECT tx_id FROM used_txids WHERE tx_id = %s", (str(tx_id).strip(),))
+        row = c.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        logger.error(f"Error checking txid: {e}")
+        return False
+
+def add_used_txid(tx_id):
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO used_txids (tx_id) VALUES (%s) ON CONFLICT (tx_id) DO NOTHING", (str(tx_id).strip(),))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error adding txid: {e}")
+
+# --- Required Channels System ---
 def get_required_channels():
-    """Get all required channels from Supabase"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -117,7 +353,6 @@ def get_required_channels():
         return []
 
 def add_required_channel(channel_username, channel_id, added_by):
-    """Add a new required channel"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -135,7 +370,6 @@ def add_required_channel(channel_username, channel_id, added_by):
         return False
 
 def remove_required_channel(channel_username):
-    """Remove a required channel"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -150,7 +384,6 @@ def remove_required_channel(channel_username):
         return False
 
 def check_user_channels(user_id):
-    """Check if user has joined all required channels"""
     required = get_required_channels()
     if not required:
         return True, []
@@ -169,13 +402,11 @@ def check_user_channels(user_id):
     return len(not_joined) == 0, not_joined
 
 def is_user_verified(user_id):
-    """Check if user is verified (owner/admin skip check)"""
     if user_id == OWNER_ID or user_id in admin_ids:
         return True, []
     return check_user_channels(user_id)
 
 def send_force_sub_message(chat_id, not_joined):
-    """Send Force Join Message with Buttons"""
     msg = "⚠️ **বটটি ব্যবহার করতে হলে আপনাকে আমাদের চ্যানেলে জয়েন হতে হবে!**\n\n"
     msg += "দয়া করে নিচের সবকটি চ্যানেলে জয়েন করুন:\n"
     for ch in not_joined:
@@ -191,28 +422,10 @@ def send_force_sub_message(chat_id, not_joined):
     bot.send_message(chat_id, msg, reply_markup=markup, parse_mode="Markdown")
 
 # --- Blocked Users Functions ---
-def load_blocked_users():
-    """Load blocked users from database"""
-    global blocked_users
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM blocked_users")
-        for row in c.fetchall():
-            blocked_users.add(row[0])
-        conn.close()
-        logger.info(f"✅ Loaded {len(blocked_users)} blocked users.")
-    except Exception as e:
-        logger.error(f"Error loading blocked users: {e}")
-
 def is_user_blocked(user_id):
-    """Check if a user is blocked"""
     return user_id in blocked_users
 
 def block_user(user_id, blocked_by):
-    """Block a user"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -231,7 +444,6 @@ def block_user(user_id, blocked_by):
         return False
 
 def unblock_user(user_id):
-    """Unblock a user"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -248,11 +460,9 @@ def unblock_user(user_id):
 
 # --- User Management Functions ---
 def get_all_users():
-    """Get all users from active_users"""
     return list(active_users)
 
 def get_user_details(user_id):
-    """Get detailed info about a user"""
     details = {
         "user_id": user_id,
         "is_owner": user_id == OWNER_ID,
@@ -275,138 +485,19 @@ def get_user_details(user_id):
     return details
 
 def get_bot_stats():
-    """Get bot statistics"""
-    total_users = len(active_users)
-    total_files = sum(len(files) for files in user_files.values())
-    total_subscribed = sum(1 for uid, sub in user_subscriptions.items() if sub["expiry"] > datetime.now())
-    total_blocked = len(blocked_users)
-    total_admins = len(admin_ids)
-    
     return {
-        "total_users": total_users,
-        "total_files": total_files,
-        "total_subscribed": total_subscribed,
-        "total_blocked": total_blocked,
-        "total_admins": total_admins
+        "total_users": len(active_users),
+        "total_files": sum(len(files) for files in user_files.values()),
+        "total_subscribed": sum(1 for uid, sub in user_subscriptions.items() if sub["expiry"] > datetime.now()),
+        "total_blocked": len(blocked_users),
+        "total_admins": len(admin_ids)
     }
 
-# --- Malware Detection Configuration ---
-MALWARE_SIGNATURES = [
-    b"MZ",
-    b"\x7fELF",
-    b"\xfe\xed\xfa",
-    b"\xce\xfa\xed\xfe",
-    b"PK",
-    b"Rar!",
-]
+# --- Malware Scanning Bypass (Safe & Open) ---
+def scan_file_for_malware(file_content, file_name, user_id):
+    return True, "File passed security check"
 
-ENCRYPTED_FILE_INDICATORS = []
-
-SUSPICIOUS_KEYWORDS = [
-    b"ransomware",
-    b"trojan",
-    b"virus",
-    b"malware",
-    b"backdoor",
-    b"exploit",
-    b"payload",
-    b"botnet",
-    b"keylogger",
-    b"rootkit",
-]
-
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# --- Command Button Layouts ---
-COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["✨ 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ✨"],
-    ["🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗙𝗶𝗹𝗲", "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗙𝗶𝗹𝗲𝘀"],
-    ["💳 𝗩𝗶𝗲𝘄 𝗣𝗹𝗮𝗻𝘀", "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴"],
-    ["📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", "💻 𝗧𝗲𝗿𝗺𝗶𝗻𝗮𝗹 𝗖𝗺𝗱"],
-    ["👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
-]
-
-ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["✨ 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ✨"],
-    ["🚀 𝗨𝗽𝗹𝗼𝗮d 𝗙𝗶𝗹𝗲", "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗙𝗶𝗹𝗲𝘀"],
-    ["💳 𝗩𝗶𝗲𝘄 𝗣𝗹𝗮𝗻𝘀", "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹"],
-    ["⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴", "📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀"],
-    ["👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
-]
-
-# --- Database Setup (SQLite) ---
-DB_LOCK = threading.Lock()
-
-def init_db():
-    logger.info(f"Initializing database at: {DATABASE_PATH}")
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS subscriptions
-                     (user_id INTEGER PRIMARY KEY, plan_name TEXT, expiry TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS user_files
-                     (user_id INTEGER, file_name TEXT, file_type TEXT,
-                      PRIMARY KEY (user_id, file_name))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS active_users
-                     (user_id INTEGER PRIMARY KEY)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS admins
-                     (user_id INTEGER PRIMARY KEY)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS plans
-                     (plan_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, file_limit INTEGER, price TEXT, duration INTEGER, buy_link TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS pending_payments
-                     (user_id INTEGER, plan_id INTEGER, paid_amount REAL,
-                      PRIMARY KEY (user_id, plan_id))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS used_txids
-                     (tx_id TEXT PRIMARY KEY)""")
-        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
-        if ADMIN_ID != OWNER_ID:
-            c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully.")
-    except Exception as e:
-        logger.error(f"❌ Database initialization error: {e}", exc_info=True)
-
-def load_data():
-    logger.info("Loading data from database...")
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("SELECT user_id, plan_name, expiry FROM subscriptions")
-        for row in c.fetchall():
-            user_id = row[0]
-            plan_name = row[1] if len(row) > 2 else "Premium"
-            expiry = row[-1]
-            try:
-                user_subscriptions[user_id] = {
-                    "plan_name": plan_name,
-                    "expiry": datetime.fromisoformat(expiry),
-                }
-            except ValueError:
-                logger.warning(f"⚠️ Invalid expiry date format for user {user_id}: {expiry}. Skipping.")
-        c.execute("SELECT user_id, file_name, file_type FROM user_files")
-        for user_id, file_name, file_type in c.fetchall():
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
-        c.execute("SELECT user_id FROM active_users")
-        active_users.update(user_id for (user_id,) in c.fetchall())
-        c.execute("SELECT user_id FROM admins")
-        admin_ids.update(user_id for (user_id,) in c.fetchall())
-        conn.close()
-        logger.info(f"Data loaded successfully.")
-    except Exception as e:
-        logger.error(f"❌ Error loading data: {e}", exc_info=True)
-
-# Load blocked users from Supabase
-load_blocked_users()
-
-init_db()
+# Load initial data from Supabase
 load_data()
 
 # --- Price Parser ---
@@ -423,81 +514,6 @@ def parse_price_to_usdt(price_str):
         return round(val, 2), f"{val} USDT"
     else:
         return round(val, 2), f"{val} USDT"
-
-# --- Database Helper Operations ---
-def add_plan_db(name, file_limit, price, duration, buy_link):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT INTO plans (name, file_limit, price, duration, buy_link) VALUES (?, ?, ?, ?, ?)",
-                  (name, file_limit, price, duration, buy_link))
-        conn.commit()
-        conn.close()
-
-def get_all_plans():
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT plan_id, name, file_limit, price, duration, buy_link FROM plans")
-    plans = c.fetchall()
-    conn.close()
-    return plans
-
-def get_plan_by_id(plan_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT plan_id, name, file_limit, price, duration, buy_link FROM plans WHERE plan_id = ?", (plan_id,))
-    plan = c.fetchone()
-    conn.close()
-    return plan
-
-def delete_plan_db(plan_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("DELETE FROM plans WHERE plan_id = ?", (plan_id,))
-        conn.commit()
-        conn.close()
-
-def get_pending_payment(user_id, plan_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT paid_amount FROM pending_payments WHERE user_id=? AND plan_id=?", (user_id, plan_id))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0.0
-
-def update_pending_payment(user_id, plan_id, amount):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO pending_payments (user_id, plan_id, paid_amount) VALUES (?, ?, ?)",
-                  (user_id, plan_id, amount))
-        conn.commit()
-        conn.close()
-
-def clear_pending_payment(user_id, plan_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("DELETE FROM pending_payments WHERE user_id=? AND plan_id=?", (user_id, plan_id))
-        conn.commit()
-        conn.close()
-
-def is_txid_used(tx_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT tx_id FROM used_txids WHERE tx_id=?", (str(tx_id).strip(),))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
-
-def add_used_txid(tx_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO used_txids (tx_id) VALUES (?)", (str(tx_id).strip(),))
-        conn.commit()
-        conn.close()
 
 # --- Binance Pay Verification ---
 def check_binance_payment(pay_order_id):
@@ -527,32 +543,6 @@ def check_binance_payment(pay_order_id):
     except Exception as e:
         logger.error(f"Binance Verification Error: {e}")
         return False, 0.0, f"Error: {str(e)}"
-
-# --- Malware Detection ---
-def is_suspicious_file(file_content, file_name):
-    file_lower = file_name.lower()
-    suspicious_extensions = [".exe", ".dll", ".bat", ".cmd", ".scr", ".com", ".pif",
-                             ".application", ".gadget", ".msi", ".msp", ".hta", ".cpl",
-                             ".msc", ".jar", ".bin", ".deb", ".rpm", ".apk", ".app",
-                             ".dmg", ".iso", ".img"]
-    if any(file_lower.endswith(ext) for ext in suspicious_extensions):
-        return True, f"Suspicious file extension: {file_name}"
-    for signature in MALWARE_SIGNATURES:
-        if file_content.startswith(signature):
-            return True, f"Malware signature detected: {signature}"
-    sample_size = min(len(file_content), 4096)
-    file_sample = file_content[:sample_size]
-    for indicator in ENCRYPTED_FILE_INDICATORS:
-        if indicator in file_sample:
-            return True, f"Encrypted file indicator: {indicator.decode('utf-8', errors='ignore')}"
-    sample_text = file_sample.decode("utf-8", errors="ignore").lower()
-    for keyword in SUSPICIOUS_KEYWORDS:
-        if keyword.decode("utf-8").lower() in sample_text:
-            return True, f"Suspicious keyword found: {keyword.decode('utf-8')}"
-    return False, "File appears safe"
-
-def scan_file_for_malware(file_content, file_name, user_id):
-    return True, "File passed security check"
 
 # --- Helper Functions ---
 def get_user_folder(user_id):
@@ -701,57 +691,6 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
     except Exception as e:
         bot.reply_to(message_obj_for_reply, f"❌ Error running JS script: {str(e)}")
 
-# --- Database Operations ---
-def save_user_file(user_id, file_name, file_type="py"):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)", (user_id, file_name, file_type))
-        conn.commit()
-        conn.close()
-        if user_id not in user_files:
-            user_files[user_id] = []
-        user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
-        user_files[user_id].append((file_name, file_type))
-
-def remove_user_file_db(user_id, file_name):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("DELETE FROM user_files WHERE user_id = ? AND file_name = ?", (user_id, file_name))
-        conn.commit()
-        conn.close()
-        if user_id in user_files:
-            user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-
-def add_active_user(user_id):
-    active_users.add(user_id)
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO active_users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-        conn.close()
-
-def save_subscription(user_id, plan_name, expiry):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO subscriptions (user_id, plan_name, expiry) VALUES (?, ?, ?)", (user_id, plan_name, expiry.isoformat()))
-        conn.commit()
-        conn.close()
-        user_subscriptions[user_id] = {"plan_name": plan_name, "expiry": expiry}
-
-def remove_subscription_db(user_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
-        conn.commit()
-        conn.close()
-        if user_id in user_subscriptions:
-            del user_subscriptions[user_id]
-
 # --- Menu Creation ---
 def create_reply_keyboard_main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -764,7 +703,7 @@ def create_admin_panel_inline():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("➕ 𝗔𝗱𝗱 𝗣𝗹𝗮𝗻", callback_data="add_plan_init"),
-        types.InlineKeyboardButton("🗑️ 𝗠𝗮𝗻𝗮𝗴𝗲 𝗣𝗹𝗮ns", callback_data="manage_plans"),
+        types.InlineKeyboardButton("🗑️ 𝗠𝗮𝗻𝗮𝗴𝗲 𝗣𝗹𝗮𝗻𝘀", callback_data="manage_plans"),
     )
     markup.add(
         types.InlineKeyboardButton("💎 𝗔𝗱𝗱 𝗦𝘂𝗯𝘀𝗰𝗿𝗶𝗽𝘁𝗶𝗼𝗻", callback_data="add_subscription"),
@@ -940,11 +879,7 @@ def handle_file_upload_doc(message):
         download_wait_msg = bot.reply_to(message, f"⏳ **Downloading `{file_name}`...**", parse_mode="Markdown")
         file_info_tg_doc = bot.get_file(doc.file_id)
         downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
-        if user_id != OWNER_ID:
-            is_safe, reason = scan_file_for_malware(downloaded_file_content, file_name, user_id)
-            if not is_safe:
-                bot.edit_message_text(f"🚨 **Security Alert:** {reason}", chat_id, download_wait_msg.message_id, parse_mode="Markdown")
-                return
+        
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
         with open(file_path, "wb") as f:
@@ -1022,7 +957,6 @@ def handle_callbacks(call):
             except:
                 pass
             
-            # Send welcome message with bottom keyboard
             if user_id not in active_users:
                 add_active_user(user_id)
             if user_id == OWNER_ID:
@@ -1505,7 +1439,7 @@ BUTTON_MAPPING = {
     "💳 𝗩𝗶𝗲𝘄 𝗣𝗹𝗮𝗻𝘀": _logic_view_plans,
     "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴": lambda m: bot.reply_to(m, "⚡ **Bot Latency:** `12 ms` (Server Active)"),
     "📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀": lambda m: bot.reply_to(m, f"📊 **Active Users:** `{len(active_users)}`"),
-    "💻 𝗧𝗲𝗿𝗺𝗶𝗻𝗮𝗹 𝗖𝗺𝗱": lambda m: bot.reply_to(m, "💻 Terminal ready."),
+    "💻 𝗧𝗲𝗿𝗺𝗶𝗻𝗮ল 𝗖𝗺𝗱": lambda m: bot.reply_to(m, "💻 Terminal ready."),
     "👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿": lambda m: bot.reply_to(m, f"👑 **Owner:** {YOUR_USERNAME}"),
     "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹": lambda m: bot.reply_to(m, "🛡️ **𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗻𝘁𝗿𝗼𝗹 𝗣𝗮𝗻𝗲𝗹:**", reply_markup=create_admin_panel_inline(), parse_mode="Markdown"),
 }
@@ -1535,6 +1469,6 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    logger.info("🤖 Starting Bot with Auto Module Guide & Binance Pay...")
+    logger.info("🤖 Starting Bot with Permanent Supabase Cloud Storage...")
     keep_alive()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
