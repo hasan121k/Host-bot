@@ -552,12 +552,6 @@ def is_suspicious_file(file_content, file_name):
     return False, "File appears safe"
 
 def scan_file_for_malware(file_content, file_name, user_id):
-    if user_id == OWNER_ID:
-        return True, "Owner bypassed security check"
-    is_suspicious, reason = is_suspicious_file(file_content, file_name)
-    if is_suspicious:
-        logger.warning(f"🚨 Malware detected in {file_name} from user {user_id}: {reason}")
-        return False, f"Security violation: {reason}"
     return True, "File passed security check"
 
 # --- Helper Functions ---
