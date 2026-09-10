@@ -95,7 +95,6 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
-    """PostgreSQL connection for Supabase"""
     if not DATABASE_URL:
         logger.error("❌ DATABASE_URL not set in environment!")
         return None
@@ -108,7 +107,6 @@ def get_db_connection():
 # --- Supabase Database Operations (Permanent Storage) ---
 
 def load_data():
-    """Load all persistent data from Supabase"""
     global active_users, admin_ids, blocked_users, user_subscriptions, user_files
     try:
         conn = get_db_connection()
@@ -116,19 +114,15 @@ def load_data():
             return
         c = conn.cursor()
 
-        # Load active users
         c.execute("SELECT user_id FROM active_users")
         active_users.update(row[0] for row in c.fetchall())
 
-        # Load admins
         c.execute("SELECT user_id FROM admins")
         admin_ids.update(row[0] for row in c.fetchall())
 
-        # Load blocked users
         c.execute("SELECT user_id FROM blocked_users")
         blocked_users.update(row[0] for row in c.fetchall())
 
-        # Load subscriptions
         c.execute("SELECT user_id, plan_name, expiry FROM subscriptions")
         for row in c.fetchall():
             uid, pname, exp = row
@@ -136,7 +130,6 @@ def load_data():
                 exp = datetime.fromisoformat(exp)
             user_subscriptions[uid] = {"plan_name": pname, "expiry": exp}
 
-        # Load user files
         c.execute("SELECT user_id, file_name, file_type FROM user_files")
         for uid, fname, ftype in c.fetchall():
             if uid not in user_files:
@@ -176,20 +169,7 @@ def save_subscription(user_id, plan_name, expiry):
     except Exception as e:
         logger.error(f"Error saving subscription: {e}")
 
-def remove_subscription_db(user_id):
-    if user_id in user_subscriptions:
-        del user_subscriptions[user_id]
-    try:
-        conn = get_db_connection()
-        if conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
-            conn.commit()
-            conn.close()
-    except Exception as e:
-        logger.error(f"Error removing subscription: {e}")
-
-def save_user_file(user_id, file_name, file_type="py"):
+def save_user_file(user_id, file_name, file_type="py", file_id=None, is_running=True):
     if user_id not in user_files:
         user_files[user_id] = []
     user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
@@ -199,14 +179,28 @@ def save_user_file(user_id, file_name, file_type="py"):
         if conn:
             c = conn.cursor()
             c.execute("""
-                INSERT INTO user_files (user_id, file_name, file_type)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id, file_name) DO UPDATE SET file_type = EXCLUDED.file_type
-            """, (user_id, file_name, file_type))
+                INSERT INTO user_files (user_id, file_name, file_type, file_id, is_running)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, file_name) DO UPDATE 
+                SET file_type = EXCLUDED.file_type, 
+                    file_id = COALESCE(EXCLUDED.file_id, user_files.file_id),
+                    is_running = EXCLUDED.is_running
+            """, (user_id, file_name, file_type, file_id, is_running))
             conn.commit()
             conn.close()
     except Exception as e:
         logger.error(f"Error saving user file: {e}")
+
+def update_file_running_status(user_id, file_name, is_running):
+    try:
+        conn = get_db_connection()
+        if conn:
+            c = conn.cursor()
+            c.execute("UPDATE user_files SET is_running = %s WHERE user_id = %s AND file_name = %s", (is_running, user_id, file_name))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error updating status: {e}")
 
 def remove_user_file_db(user_id, file_name):
     if user_id in user_files:
@@ -336,6 +330,48 @@ def add_used_txid(tx_id):
             conn.close()
     except Exception as e:
         logger.error(f"Error adding txid: {e}")
+
+# --- Auto Restart & Restore Scripts ---
+def auto_restart_all_scripts():
+    """Restores files from Telegram and restarts running scripts upon bot launch"""
+    time.sleep(5)
+    logger.info("🔄 Auto-restarting active user scripts...")
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        c = conn.cursor()
+        c.execute("SELECT user_id, file_name, file_type, file_id, is_running FROM user_files WHERE is_running = TRUE")
+        running_files = c.fetchall()
+        conn.close()
+
+        for uid, fname, ftype, fid, is_run in running_files:
+            try:
+                ufolder = get_user_folder(uid)
+                fpath = os.path.join(ufolder, fname)
+                
+                # If file doesn't exist locally, restore from Telegram
+                if not os.path.exists(fpath) and fid:
+                    try:
+                        file_info = bot.get_file(fid)
+                        content = bot.download_file(file_info.file_path)
+                        with open(fpath, "wb") as f:
+                            f.write(content)
+                        logger.info(f"📥 Restored {fname} for user {uid} from Telegram Cloud.")
+                    except Exception as err:
+                        logger.error(f"Failed to restore {fname}: {err}")
+                        continue
+                
+                if os.path.exists(fpath):
+                    if ftype == "js":
+                        run_js_script(fpath, uid, ufolder, fname, message_obj_for_reply=None)
+                    else:
+                        run_script(fpath, uid, ufolder, fname, message_obj_for_reply=None)
+                    logger.info(f"🚀 Auto-restarted {fname} for user {uid}")
+            except Exception as ex:
+                logger.error(f"Error restarting {fname}: {ex}")
+    except Exception as e:
+        logger.error(f"Error in auto-restart system: {e}")
 
 # --- Required Channels System ---
 def get_required_channels():
@@ -493,11 +529,10 @@ def get_bot_stats():
         "total_admins": len(admin_ids)
     }
 
-# --- Malware Scanning Bypass (Safe & Open) ---
+# --- Malware Scanning Bypass ---
 def scan_file_for_malware(file_content, file_name, user_id):
     return True, "File passed security check"
 
-# Load initial data from Supabase
 load_data()
 
 # --- Price Parser ---
@@ -652,18 +687,20 @@ def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, 
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton(f"📦 Install {pkg_name}", callback_data=f"instmod_{script_owner_id}_{missing_module}_{file_name}"))
                 markup.add(types.InlineKeyboardButton("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}"))
-                bot.reply_to(message_obj_for_reply, error_msg, reply_markup=markup, parse_mode="Markdown")
+                if message_obj_for_reply:
+                    bot.reply_to(message_obj_for_reply, error_msg, reply_markup=markup, parse_mode="Markdown")
             else:
                 error_msg = (f"⚠️ **আপনার কোডে ভুল (Syntax/Runtime Error) পাওয়া গেছে!**\n\n"
                              f"📄 **File:** `{file_name}`\n"
                              f"সুনির্দিষ্ট এরর জানতে নিচের **View Logs** বাটনে ক্লিক করুন।")
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}"))
-                bot.reply_to(message_obj_for_reply, error_msg, reply_markup=markup, parse_mode="Markdown")
+                if message_obj_for_reply:
+                    bot.reply_to(message_obj_for_reply, error_msg, reply_markup=markup, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Error checking log file: {e}")
 
-def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply):
+def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply=None):
     script_key = f"{script_owner_id}_{file_name}"
     try:
         log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
@@ -672,12 +709,15 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name,
                                    "script_owner_id": script_owner_id, "start_time": datetime.now(),
                                    "user_folder": user_folder, "type": "py", "script_key": script_key}
-        bot.reply_to(message_obj_for_reply, f"🚀 **Python Script Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown")
+        update_file_running_status(script_owner_id, file_name, True)
+        if message_obj_for_reply:
+            bot.reply_to(message_obj_for_reply, f"🚀 **Python Script Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown")
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
     except Exception as e:
-        bot.reply_to(message_obj_for_reply, f"❌ Error running script: {str(e)}")
+        if message_obj_for_reply:
+            bot.reply_to(message_obj_for_reply, f"❌ Error running script: {str(e)}")
 
-def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply):
+def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply=None):
     script_key = f"{script_owner_id}_{file_name}"
     try:
         log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
@@ -686,10 +726,13 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name,
                                    "script_owner_id": script_owner_id, "start_time": datetime.now(),
                                    "user_folder": user_folder, "type": "js", "script_key": script_key}
-        bot.reply_to(message_obj_for_reply, f"🚀 **JS Script Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown")
+        update_file_running_status(script_owner_id, file_name, True)
+        if message_obj_for_reply:
+            bot.reply_to(message_obj_for_reply, f"🚀 **JS Script Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown")
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
     except Exception as e:
-        bot.reply_to(message_obj_for_reply, f"❌ Error running JS script: {str(e)}")
+        if message_obj_for_reply:
+            bot.reply_to(message_obj_for_reply, f"❌ Error running JS script: {str(e)}")
 
 # --- Menu Creation ---
 def create_reply_keyboard_main_menu(user_id):
@@ -703,7 +746,7 @@ def create_admin_panel_inline():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("➕ 𝗔𝗱𝗱 𝗣𝗹𝗮𝗻", callback_data="add_plan_init"),
-        types.InlineKeyboardButton("🗑️ 𝗠𝗮𝗻𝗮𝗴𝗲 𝗣𝗹𝗮𝗻𝘀", callback_data="manage_plans"),
+        types.InlineKeyboardButton("🗑️ 𝗠𝗮𝗻𝗮𝗴𝗲 𝗣𝗹𝗮ns", callback_data="manage_plans"),
     )
     markup.add(
         types.InlineKeyboardButton("💎 𝗔𝗱𝗱 𝗦𝘂𝗯𝘀𝗰𝗿𝗶𝗽𝘁𝗶𝗼𝗻", callback_data="add_subscription"),
@@ -885,11 +928,13 @@ def handle_file_upload_doc(message):
         with open(file_path, "wb") as f:
             f.write(downloaded_file_content)
         bot.edit_message_text(f"✅ **File `{file_name}` uploaded successfully!**", chat_id, download_wait_msg.message_id, parse_mode="Markdown")
+        
+        # Save file_id to Supabase so it can be restored on redeploy
         if file_ext == ".js":
-            save_user_file(user_id, file_name, "js")
+            save_user_file(user_id, file_name, "js", file_id=doc.file_id, is_running=True)
             threading.Thread(target=run_js_script, args=(file_path, user_id, user_folder, file_name, message)).start()
         elif file_ext == ".py":
-            save_user_file(user_id, file_name, "py")
+            save_user_file(user_id, file_name, "py", file_id=doc.file_id, is_running=True)
             threading.Thread(target=run_script, args=(file_path, user_id, user_folder, file_name, message)).start()
     except Exception as e:
         bot.reply_to(message, f"❌ **Error:** {str(e)}")
@@ -1209,12 +1254,45 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{owner_id}_{fname}"))
         bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{'Running' if is_running else 'Stopped'}`", reply_markup=markup, parse_mode="Markdown")
 
+    elif data.startswith("start_"):
+        _, owner_id, fname = data.split("_", 2)
+        ufolder = get_user_folder(int(owner_id))
+        fpath = os.path.join(ufolder, fname)
+        ext = os.path.splitext(fname)[1].lower()
+        
+        # If not present locally, fetch from Supabase/Telegram
+        if not os.path.exists(fpath):
+            try:
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute("SELECT file_id FROM user_files WHERE user_id = %s AND file_name = %s", (int(owner_id), fname))
+                row = c.fetchone()
+                conn.close()
+                if row and row[0]:
+                    f_info = bot.get_file(row[0])
+                    cnt = bot.download_file(f_info.file_path)
+                    with open(fpath, "wb") as f:
+                        f.write(cnt)
+            except Exception as e:
+                logger.error(f"Error fetching file: {e}")
+
+        if os.path.exists(fpath):
+            if ext == ".js":
+                run_js_script(fpath, int(owner_id), ufolder, fname, call.message)
+            else:
+                run_script(fpath, int(owner_id), ufolder, fname, call.message)
+            update_file_running_status(int(owner_id), fname, True)
+            bot.answer_callback_query(call.id, "Started!")
+        else:
+            bot.answer_callback_query(call.id, "File not found on server!", show_alert=True)
+
     elif data.startswith("stop_"):
         _, owner_id, fname = data.split("_", 2)
         skey = f"{owner_id}_{fname}"
         if skey in bot_scripts:
             kill_process_tree(bot_scripts[skey])
             del bot_scripts[skey]
+        update_file_running_status(int(owner_id), fname, False)
         bot.answer_callback_query(call.id, "Stopped!")
         bot.send_message(call.message.chat.id, f"🛑 Script `{fname}` stopped.", parse_mode="Markdown")
 
@@ -1469,6 +1547,8 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    logger.info("🤖 Starting Bot with Permanent Supabase Cloud Storage...")
+    logger.info("🤖 Starting Bot with Auto-Restart & Telegram Cloud...")
     keep_alive()
+    # Start auto-restart thread on startup
+    threading.Thread(target=auto_restart_all_scripts, daemon=True).start()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
