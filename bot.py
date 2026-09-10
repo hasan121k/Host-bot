@@ -158,18 +158,10 @@ def check_user_channels(user_id):
     not_joined = []
     for channel_username, channel_id in required:
         try:
-            chat = None
-            if channel_username and channel_username.startswith('@'):
-                chat = bot.get_chat(channel_username)
-            elif channel_id:
-                chat = bot.get_chat(channel_id)
-            else:
-                continue
-            
-            if chat:
-                member = bot.get_chat_member(chat.id, user_id)
-                if member.status not in ['member', 'administrator', 'creator']:
-                    not_joined.append(channel_username)
+            target_chat_id = channel_id if channel_id else channel_username
+            member = bot.get_chat_member(target_chat_id, user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                not_joined.append(channel_username)
         except Exception as e:
             logger.error(f"Error checking channel {channel_username}: {e}")
             not_joined.append(channel_username)
@@ -181,6 +173,22 @@ def is_user_verified(user_id):
     if user_id == OWNER_ID or user_id in admin_ids:
         return True, []
     return check_user_channels(user_id)
+
+def send_force_sub_message(chat_id, not_joined):
+    """Send Force Join Message with Buttons"""
+    msg = "⚠️ **বটটি ব্যবহার করতে হলে আপনাকে আমাদের চ্যানেলে জয়েন হতে হবে!**\n\n"
+    msg += "দয়া করে নিচের সবকটি চ্যানেলে জয়েন করুন:\n"
+    for ch in not_joined:
+        msg += f"• {ch}\n"
+    msg += "\n✅ সব চ্যানেলে জয়েন করে **'🔄 চেক করুন'** বাটনে ক্লিক করুন।"
+    
+    markup = types.InlineKeyboardMarkup()
+    for ch in not_joined:
+        clean_user = ch.replace('@', '')
+        markup.add(types.InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{clean_user}"))
+    markup.add(types.InlineKeyboardButton("🔄 চেক করুন", callback_data="check_verify"))
+    
+    bot.send_message(chat_id, msg, reply_markup=markup, parse_mode="Markdown")
 
 # --- 🆕 Blocked Users Functions ---
 def load_blocked_users():
@@ -815,6 +823,12 @@ def _logic_send_welcome(message):
         bot.send_message(chat_id, "🚫 **আপনি বট ব্যবহার করতে পারবেন না। আপনি ব্লক করা হয়েছেন।**")
         return
     
+    # 🔒 Force Subscription Check
+    is_verified, not_joined = is_user_verified(user_id)
+    if not is_verified:
+        send_force_sub_message(chat_id, not_joined)
+        return
+
     if bot_locked and user_id not in admin_ids:
         bot.send_message(chat_id, "⚠️ **Bot is temporarily locked by Admin.**")
         return
@@ -861,26 +875,18 @@ def _logic_view_plans(message_or_call):
 
 def _logic_upload_file(message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     
     # Check if user is blocked
     if is_user_blocked(user_id) and user_id not in admin_ids:
         bot.reply_to(message, "🚫 **আপনি ব্লক করা হয়েছেন। আপনি ফাইল আপলোড করতে পারবেন না।**")
         return
     
-    # Channel Check (Owner/Admin skip)
-    if user_id not in admin_ids and user_id != OWNER_ID:
-        is_verified, not_joined = is_user_verified(user_id)
-        if not is_verified:
-            msg = "⚠️ **আপনাকে নিচের চ্যানেলগুলো জয়েন করতে হবে:**\n\n"
-            for ch in not_joined:
-                msg += f"• {ch}\n"
-            msg += "\n✅ সব চ্যানেল জয়েন করে আবার চেষ্টা করুন।"
-            markup = types.InlineKeyboardMarkup()
-            for ch in not_joined:
-                markup.add(types.InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.replace('@', '')}"))
-            markup.add(types.InlineKeyboardButton("🔄 Check Again", callback_data="check_verify"))
-            bot.reply_to(message, msg, reply_markup=markup, parse_mode="Markdown")
-            return
+    # 🔒 Force Subscription Check
+    is_verified, not_joined = is_user_verified(user_id)
+    if not is_verified:
+        send_force_sub_message(chat_id, not_joined)
+        return
     
     if bot_locked and user_id not in admin_ids:
         bot.reply_to(message, "⚠️ **Bot is locked by Admin.**")
@@ -906,6 +912,14 @@ def _logic_upload_file(message):
 
 def _logic_check_files(message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # 🔒 Force Subscription Check
+    is_verified, not_joined = is_user_verified(user_id)
+    if not is_verified:
+        send_force_sub_message(chat_id, not_joined)
+        return
+        
     user_files_list = user_files.get(user_id, [])
     if not user_files_list:
         bot.reply_to(message, "📂 **Your Uploaded Files:**\n\n*(No files uploaded yet)*", parse_mode="Markdown")
@@ -928,6 +942,12 @@ def handle_file_upload_doc(message):
     # Check if user is blocked
     if is_user_blocked(user_id) and user_id not in admin_ids:
         bot.reply_to(message, "🚫 **আপনি ব্লক করা হয়েছেন। আপনি ফাইল আপলোড করতে পারবেন না।**")
+        return
+
+    # 🔒 Force Subscription Check
+    is_verified, not_joined = is_user_verified(user_id)
+    if not is_verified:
+        send_force_sub_message(chat_id, not_joined)
         return
     
     if user_id not in admin_ids and user_id != OWNER_ID:
@@ -1016,21 +1036,27 @@ def handle_callbacks(call):
         user_id = call.from_user.id
         is_verified, not_joined = is_user_verified(user_id)
         if is_verified:
-            bot.edit_message_text(
-                "✅ **ভেরিফাইড!** এখন আপনি ফাইল আপলোড করতে পারবেন।",
-                call.message.chat.id,
-                call.message.message_id
-            )
+            bot.answer_callback_query(call.id, "✅ ধন্যবাদ! আপনি সফলভাবে সব চ্যানেলে জয়েন করেছেন।")
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except:
+                pass
+            _logic_send_welcome(call)
         else:
-            msg = "⚠️ **এখনো এই চ্যানেলগুলো জয়েন করেনি:**\n\n"
+            bot.answer_callback_query(call.id, "❌ আপনি এখনো সবগুলো চ্যানেলে জয়েন করেননি!", show_alert=True)
+            msg = "⚠️ **আপনি এখনো নিচের চ্যানেলগুলো জয়েন করেননি:**\n\n"
             for ch in not_joined:
                 msg += f"• {ch}\n"
-            msg += "\n✅ জয়েন করে **Check Again** প্রেস করুন।"
+            msg += "\n✅ জয়েন করে **'🔄 চেক করুন'** বাটনে ক্লিক করুন।"
             markup = types.InlineKeyboardMarkup()
             for ch in not_joined:
-                markup.add(types.InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.replace('@', '')}"))
-            markup.add(types.InlineKeyboardButton("🔄 Check Again", callback_data="check_verify"))
-            bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup)
+                clean_user = ch.replace('@', '')
+                markup.add(types.InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{clean_user}"))
+            markup.add(types.InlineKeyboardButton("🔄 চেক করুন", callback_data="check_verify"))
+            try:
+                bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            except:
+                pass
 
     # --- 🆕 All Users Callback ---
     elif data == "all_users" and user_id in admin_ids:
@@ -1043,7 +1069,6 @@ def handle_callbacks(call):
         total = len(users)
         msg = f"📋 **ইউজার লিস্ট** (মোট: {total})\n\n"
         
-        # Show first 10 users with pagination
         page = 0
         per_page = 10
         start = page * per_page
@@ -1372,7 +1397,6 @@ def process_block_user(message):
         
         if block_user(target_id, user_id):
             bot.reply_to(message, f"✅ **ইউজার `{target_id}` ব্লক করা হয়েছে!**\n\nএই ইউজার এখন বট ব্যবহার করতে পারবেনা।")
-            # Try to notify the user
             try:
                 bot.send_message(target_id, "🚫 **আপনি বট ব্যবহার থেকে ব্লক করা হয়েছেন।**")
             except:
@@ -1488,6 +1512,16 @@ BUTTON_MAPPING = {
 
 @bot.message_handler(func=lambda m: m.text in BUTTON_MAPPING)
 def handle_main_buttons(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # 🔒 Force Subscription Check for any button click (excluding admin buttons for admins)
+    if message.text != "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹" or user_id not in admin_ids:
+        is_verified, not_joined = is_user_verified(user_id)
+        if not is_verified:
+            send_force_sub_message(chat_id, not_joined)
+            return
+            
     BUTTON_MAPPING[message.text](message)
 
 @bot.message_handler(commands=["start"])
